@@ -2,4 +2,3 @@ node_modules
 .env
 pm2-logs.txt
 pnpm-dev-logs.txt
-pnpm-lock.yaml
