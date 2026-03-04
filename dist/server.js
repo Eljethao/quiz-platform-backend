@@ -28,6 +28,18 @@ app.use(express_1.default.json());
 // Routes
 app.use('/api/auth', auth_1.default);
 app.use('/api/quizzes', quizzes_1.default);
+// Health check route
+app.get('/health', (_req, res) => {
+    var _a;
+    const dbState = mongoose_1.default.connection.readyState;
+    const dbStatus = (_a = ['disconnected', 'connected', 'connecting', 'disconnecting'][dbState]) !== null && _a !== void 0 ? _a : 'unknown';
+    res.status(dbState === 1 ? 200 : 503).json({
+        status: dbState === 1 ? 'ok' : 'degraded',
+        uptime: Math.floor(process.uptime()),
+        database: dbStatus,
+        timestamp: new Date().toISOString()
+    });
+});
 // Database connection
 const MONGODB_URI = process.env.MONGODB_URI;
 mongoose_1.default.connect(MONGODB_URI)
