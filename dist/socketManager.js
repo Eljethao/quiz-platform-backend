@@ -21,7 +21,6 @@ function socketManager(io) {
         socket.on('host-join', (data) => __awaiter(this, void 0, void 0, function* () {
             const { quizId, hostId } = data;
             const pin = generatePIN();
-            // create game state
             activeGames.set(pin, {
                 pin,
                 quizId,
@@ -29,49 +28,59 @@ function socketManager(io) {
                 hostSocketId: socket.id,
                 players: [],
                 currentQuestionIndex: -1,
-                isActive: false
+                isActive: false,
+                answeredNicknames: new Set()
             });
             socket.join(pin);
             socket.emit('game-created', { pin });
             console.log(`Host created game with PIN: ${pin}`);
         }));
-        // player-join: Player enters PIN and nickname, joining the specific Socket room. Emit to host to update lobby.
+        // player-join: Player enters PIN and nickname, joining the specific Socket room.
         socket.on('player-join', (data) => {
+            var _a, _b;
             const { pin, nickname, avatar } = data;
             const game = activeGames.get(pin);
             if (!game) {
                 socket.emit('error', 'Game not found');
                 return;
             }
-            // Check if player is rejoining
+            // Check if player is rejoining (by nickname — persistent across reconnects)
             const existingPlayerIndex = game.players.findIndex(p => p.nickname === nickname);
             if (existingPlayerIndex !== -1) {
-                // Re-connect the existing player
+                // Update socket ID to the new connection
                 game.players[existingPlayerIndex].socketId = socket.id;
-                game.players[existingPlayerIndex].avatar = avatar; // Update avatar if it changed
+                game.players[existingPlayerIndex].avatar = avatar;
             }
             else {
-                // Add new player
                 const player = { socketId: socket.id, nickname, avatar, score: 0 };
                 game.players.push(player);
             }
             socket.join(pin);
             socket.emit('joined-lobby', { pin, nickname, avatar });
-            // Emit to host to update lobby
+            // Update lobby display on host side
             io.to(game.hostSocketId).emit('update-lobby', game.players);
-            console.log(`Player ${nickname} joined game ${pin}. Avatar length: ${(avatar === null || avatar === void 0 ? void 0 : avatar.length) || 0}`);
-            // If a game is currently active and a question is running, catch the player up
+            console.log(`Player ${nickname} joined/rejoined game ${pin}.`);
+            // Catch-up logic: if a question is active AND this player hasn't answered yet,
+            // send them the current question so they can still participate.
+            // IMPORTANT: if they already answered, send 'already-answered' so the
+            // frontend knows to show "Waiting for others..." instead of resetting.
             if (game.isActive && game.currentQuestion) {
-                const playerQuestion = {
-                    questionText: game.currentQuestion.questionText,
-                    options: game.currentQuestion.options,
-                    timeLimit: game.currentQuestion.timeLimit,
-                };
-                // Emit only to this specific rejoining player
-                socket.emit('question-started', playerQuestion);
+                const alreadyAnswered = (_b = (_a = game.answeredNicknames) === null || _a === void 0 ? void 0 : _a.has(nickname)) !== null && _b !== void 0 ? _b : false;
+                if (alreadyAnswered) {
+                    // Tell the frontend to stay on the waiting screen
+                    socket.emit('already-answered');
+                }
+                else {
+                    const playerQuestion = {
+                        questionText: game.currentQuestion.questionText,
+                        options: game.currentQuestion.options,
+                        timeLimit: game.currentQuestion.timeLimit,
+                    };
+                    socket.emit('question-started', playerQuestion);
+                }
             }
         });
-        // start-game: Host starts the game. Emit to room to switch to question view.
+        // start-game: Host starts the game.
         socket.on('start-game', (pin) => {
             const game = activeGames.get(pin);
             if (game && game.hostSocketId === socket.id) {
@@ -79,28 +88,27 @@ function socketManager(io) {
                 io.to(pin).emit('game-started');
             }
         });
-        // next-question: Send question data (excluding correct answer) to players. Send full data to Host screen.
+        // next-question: Host sends the next question to all players.
         socket.on('next-question', (data) => {
-            const { pin, question } = data; // Host sends full question object
+            const { pin, question } = data;
             const game = activeGames.get(pin);
             if (game && game.hostSocketId === socket.id) {
                 game.currentQuestionIndex++;
-                // Start time for score calculation
                 game.questionStartTime = Date.now();
-                game.currentQuestion = question; // store question to calculate scores later
-                game.answeredPlayerIds = []; // reset who answered
-                // Send stripped down question to players 
+                game.currentQuestion = question;
+                game.answeredPlayerIds = [];
+                game.answeredNicknames = new Set(); // reset per-question answered set
                 const playerQuestion = {
                     questionText: question.questionText,
-                    options: question.options, // Send actual option text, not just indices
+                    options: question.options,
                     timeLimit: question.timeLimit,
                 };
                 socket.broadcast.to(pin).emit('question-started', playerQuestion);
-                // host knows the full question anyway from their frontend state
             }
         });
-        // submit-answer: Calculate score based on correct answer and time taken.
+        // submit-answer: Player submits an answer. Score is calculated server-side.
         socket.on('submit-answer', (data) => {
+            var _a, _b;
             const { pin, answerIndex } = data;
             const game = activeGames.get(pin);
             if (!game)
@@ -108,11 +116,13 @@ function socketManager(io) {
             const player = game.players.find(p => p.socketId === socket.id);
             if (!player)
                 return;
+            // Prevent double-submit (e.g., if the player somehow triggers this twice)
+            if ((_a = game.answeredNicknames) === null || _a === void 0 ? void 0 : _a.has(player.nickname))
+                return;
             const timeTaken = (Date.now() - (game.questionStartTime || 0)) / 1000;
             let scoreEarned = 0;
             let isCorrect = false;
             if (game.currentQuestion && answerIndex === game.currentQuestion.correctOptionIndex) {
-                // simple score calculation based on max 1000 pts per question, minus time penalty
                 const timeLimit = game.currentQuestion.timeLimit;
                 scoreEarned = Math.max(0, Math.floor(1000 * (1 - (timeTaken / timeLimit / 2))));
                 isCorrect = true;
@@ -120,29 +130,27 @@ function socketManager(io) {
             player.score += scoreEarned;
             if (!game.answeredPlayerIds)
                 game.answeredPlayerIds = [];
-            game.answeredPlayerIds.push(player.socketId);
-            // Send result back to player
+            game.answeredPlayerIds.push(socket.id);
+            (_b = game.answeredNicknames) === null || _b === void 0 ? void 0 : _b.add(player.nickname); // track by nickname for rejoin safety
             socket.emit('answer-result', { isCorrect, score: player.score, scoreEarned });
-            // Update host with real-time answer graph
             io.to(game.hostSocketId).emit('player-answered', { answerIndex });
         });
-        // time-up: Host signifies that the timer for the current question ran out.
+        // time-up: Host's timer expired. Broadcast timeout to everyone in the room.
         socket.on('time-up', (pin) => {
             const game = activeGames.get(pin);
             if (game && game.hostSocketId === socket.id) {
-                // Broadcast to the whole room that time is up, so the frontend can route them to the wait screen even if socketId mismatched
-                io.to(pin).emit('answer-result', { isCorrect: false, score: 0, scoreEarned: 0, isTimeout: true });
-                // For scoring purposes, also cleanly iterate over players who haven't answered
+                // Send timeout signal to players who haven't answered yet
                 game.players.forEach(p => {
-                    var _a, _b;
-                    const hasAnswered = ((_a = game.answeredPlayerIds) === null || _a === void 0 ? void 0 : _a.includes(p.socketId)) || ((_b = game.answeredPlayerIds) === null || _b === void 0 ? void 0 : _b.includes(p.nickname));
+                    var _a, _b, _c;
+                    const hasAnswered = (_b = (_a = game.answeredNicknames) === null || _a === void 0 ? void 0 : _a.has(p.nickname)) !== null && _b !== void 0 ? _b : false;
                     if (!hasAnswered) {
-                        // They score 0
+                        io.to(p.socketId).emit('answer-result', { isCorrect: false, score: p.score, scoreEarned: 0, isTimeout: true });
+                        (_c = game.answeredNicknames) === null || _c === void 0 ? void 0 : _c.add(p.nickname); // mark as "handled"
                     }
                 });
             }
         });
-        // show-leaderboard: Send updated scores to the Host screen.
+        // show-leaderboard: Send sorted scores to everyone.
         socket.on('show-leaderboard', (pin) => {
             const game = activeGames.get(pin);
             if (game && game.hostSocketId === socket.id) {
@@ -151,8 +159,7 @@ function socketManager(io) {
             }
         });
         socket.on('disconnect', () => {
-            // Find if it was a player or host
-            // In a robust app, we'd handle cleanup here. Leaving simple for now.
+            // Intentionally left minimal — player state is preserved in activeGames for rejoin
         });
     });
 }
