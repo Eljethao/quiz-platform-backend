@@ -20,6 +20,24 @@ function socketManager(io) {
         // host-join: Host initializes a game room, generating a 6-digit PIN.
         socket.on('host-join', (data) => __awaiter(this, void 0, void 0, function* () {
             const { quizId, hostId } = data;
+            // Check if this host already has an active game for this quiz, to reconnect them
+            let existingPin = null;
+            for (const [pin, g] of activeGames.entries()) {
+                if (g.hostId === hostId && g.quizId === quizId) {
+                    existingPin = pin;
+                    break;
+                }
+            }
+            if (existingPin) {
+                // Reconnect existing host
+                const game = activeGames.get(existingPin);
+                game.hostSocketId = socket.id;
+                socket.join(existingPin);
+                socket.emit('game-created', { pin: existingPin });
+                socket.emit('update-lobby', game.players);
+                console.log(`Host reconnected to game with PIN: ${existingPin}`);
+                return;
+            }
             const pin = generatePIN();
             activeGames.set(pin, {
                 pin,
@@ -60,14 +78,10 @@ function socketManager(io) {
             // Update lobby display on host side
             io.to(game.hostSocketId).emit('update-lobby', game.players);
             console.log(`Player ${nickname} joined/rejoined game ${pin}.`);
-            // Catch-up logic: if a question is active AND this player hasn't answered yet,
-            // send them the current question so they can still participate.
-            // IMPORTANT: if they already answered, send 'already-answered' so the
-            // frontend knows to show "Waiting for others..." instead of resetting.
+            // Catch-up logic for Player
             if (game.isActive && game.currentQuestion) {
                 const alreadyAnswered = (_b = (_a = game.answeredNicknames) === null || _a === void 0 ? void 0 : _a.has(nickname)) !== null && _b !== void 0 ? _b : false;
                 if (alreadyAnswered) {
-                    // Tell the frontend to stay on the waiting screen
                     socket.emit('already-answered');
                 }
                 else {
@@ -77,6 +91,41 @@ function socketManager(io) {
                         timeLimit: game.currentQuestion.timeLimit,
                     };
                     socket.emit('question-started', playerQuestion);
+                }
+            }
+        });
+        // request-current-state: Player or Host explicitly asks for the current game state (e.g., after refresh lost location.state)
+        socket.on('request-current-state', (data) => {
+            var _a, _b;
+            const { pin, isHost } = data;
+            const game = activeGames.get(pin);
+            if (!game)
+                return;
+            if (isHost && game.hostSocketId === socket.id) {
+                // Return host specific recovery details
+                socket.emit('host-state-recovered', {
+                    currentQuestionIndex: game.currentQuestionIndex,
+                    isActive: game.isActive,
+                    players: game.players
+                });
+            }
+            else if (!isHost) {
+                // Player recovery
+                if (game.isActive && game.currentQuestion) {
+                    const player = game.players.find(p => p.socketId === socket.id);
+                    const nickname = (player === null || player === void 0 ? void 0 : player.nickname) || '';
+                    const alreadyAnswered = (_b = (_a = game.answeredNicknames) === null || _a === void 0 ? void 0 : _a.has(nickname)) !== null && _b !== void 0 ? _b : false;
+                    if (alreadyAnswered) {
+                        socket.emit('already-answered');
+                    }
+                    else {
+                        const playerQuestion = {
+                            questionText: game.currentQuestion.questionText,
+                            options: game.currentQuestion.options,
+                            timeLimit: game.currentQuestion.timeLimit,
+                        };
+                        socket.emit('question-started', playerQuestion);
+                    }
                 }
             }
         });
@@ -151,11 +200,13 @@ function socketManager(io) {
             }
         });
         // show-leaderboard: Send sorted scores to everyone.
-        socket.on('show-leaderboard', (pin) => {
+        socket.on('show-leaderboard', (data) => {
+            const pin = typeof data === 'string' ? data : data.pin; // fallback for older clients
             const game = activeGames.get(pin);
             if (game && game.hostSocketId === socket.id) {
                 const sortedPlayers = [...game.players].sort((a, b) => b.score - a.score);
-                io.to(pin).emit('leaderboard', sortedPlayers);
+                const isFinal = typeof data === 'object' ? data.isFinal : false;
+                io.to(pin).emit('leaderboard', { players: sortedPlayers, isFinal });
             }
         });
         socket.on('disconnect', () => {
